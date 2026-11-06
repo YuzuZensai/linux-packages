@@ -1,0 +1,7 @@
+{
+  "github": "YuzuZensai/linux-packages",
+  "name": "yuzu",
+  "label": "Yuzu's Linux packages",
+  "maintainer": "Yuzu <yuzu@kirameki.cafe>",
+  "architectures": ["x86_64", "aarch64"]
+}

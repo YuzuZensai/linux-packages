@@ -1,0 +1,24 @@
+name: Check packaging
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes makepkg pacman-package-manager fakeroot zstd squashfs-tools dpkg-dev libarchive-tools desktop-file-utils
+      - name: Validate app manifests
+        run: python3 scripts/build.py --check
+      - name: Exercise packages, signatures, and repository clients
+        run: python3 -m unittest discover -s tests -v
