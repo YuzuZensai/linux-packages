@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -38,8 +40,13 @@ class KeySelection(unittest.TestCase):
         listing = "\n".join([
             key(), identity("A", r"Signing\x3a \xe6\x97\xa5\xe6\x9c\xac <one@example.invalid>"),
             key(capabilities="cE"), identity("B", "Encryption only"), key("ssb", "e"),
-            key(capabilities="cS", secret="#"), identity("C", "Offline primary"), key("ssb", "s"),
-            key(validity="r"), identity("D", "Revoked"), key("ssb", "s"),
+            key(capabilities="cS", secret="#"), identity("C", "Offline primary"),
+            key("ssb", "s"), "fpr:::::::::" + "4" * 40 + ":",
+            key("ssb", "s"), "fpr:::::::::" + "5" * 40 + ":",
+            key("ssb", "e"), "fpr:::::::::" + "6" * 40 + ":",
+            key("ssb", "s", secret="#"), "fpr:::::::::" + "7" * 40 + ":",
+            key(validity="r"), identity("D", "Revoked"),
+            key("ssb", "s"), "fpr:::::::::" + "8" * 40 + ":",
             key(expiry="1"), identity("E", "Expired"),
             key(capabilities="sD"), identity("F", "Disabled"),
             key(secret="#"), identity("1", "Missing private key"),
@@ -51,8 +58,10 @@ class KeySelection(unittest.TestCase):
         with patch.object(distribution, "run", return_value=response):
             keys = distribution.signing_keys()
 
-        self.assertEqual([item["fingerprint"] for item in keys], ["A" * 40, "C" * 40, "3" * 40])
+        self.assertEqual([item["fingerprint"] for item in keys], ["A" * 40, "4" * 40, "5" * 40, "3" * 40])
         self.assertEqual(keys[0]["name"], "Signing: 日本 <one@example.invalid>")
+        self.assertTrue(keys[1]["subkey"])
+        self.assertEqual(keys[1]["name"], "Offline primary")
 
     def test_selection_requires_a_valid_choice_in_a_terminal(self):
         keys = [{"name": "First", "fingerprint": "A" * 40},
@@ -60,7 +69,7 @@ class KeySelection(unittest.TestCase):
         with patch.object(sys.stdin, "isatty", return_value=True), \
                 patch("builtins.input", side_effect=["0", "9", "invalid", "2"]), \
                 patch("sys.stdout", new_callable=io.StringIO):
-            self.assertEqual(distribution.select_key(keys), "B" * 40)
+            self.assertEqual(distribution.select_key(keys), "B" * 40 + "!")
 
         with patch.object(sys.stdin, "isatty", return_value=False):
             with self.assertRaisesRegex(ValueError, "--key"):
@@ -81,6 +90,63 @@ class KeySelection(unittest.TestCase):
 
         remove.assert_not_called()
         upload.assert_not_called()
+
+    def test_local_build_does_not_contact_github_or_request_a_token(self):
+        with patch.object(sys, "argv", ["release.py", "--key", "A" * 40]), \
+                patch.object(distribution, "Signer"), \
+                patch.object(distribution.shutil, "rmtree"), \
+                patch.object(distribution, "run") as build, \
+                patch.object(distribution, "assemble") as assemble_local, \
+                patch.object(distribution, "GitHub") as github, \
+                patch.object(distribution, "restore") as restore, \
+                patch.object(distribution.getpass, "getpass") as prompt:
+            distribution.main()
+
+        build.assert_called_once()
+        assemble_local.assert_called_once()
+        github.assert_not_called()
+        restore.assert_not_called()
+        prompt.assert_not_called()
+
+
+class GitHubRequests(unittest.TestCase):
+    def test_streams_uploads_and_keeps_credentials_off_download_redirects(self):
+        github = distribution.GitHub("owner/repository", "test-token")
+        requests = []
+        bodies = []
+
+        def respond(request, **kwargs):
+            requests.append(request)
+            bodies.append(request.data.read() if hasattr(request.data, "read") else request.data)
+            return io.BytesIO(b'{"id": 2, "name": "Packages"}')
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(distribution, "urlopen", respond):
+            path = Path(temporary) / "Packages"
+            path.write_bytes(b"package index\n")
+            release = {"id": 1, "assets": [{"id": 7, "name": "Packages"}]}
+            github.upload(release, path, replace=True)
+            github.download(release, "Packages", Path(temporary))
+
+        self.assertEqual(requests[0].method, "DELETE")
+        self.assertEqual(requests[1].full_url,
+                         "https://uploads.github.com/repos/owner/repository/releases/1/assets?name=Packages")
+        self.assertEqual(bodies[1], b"package index\n")
+        self.assertEqual(requests[1].get_header("Content-length"), "14")
+        self.assertEqual(requests[2].get_header("Authorization"), "Bearer test-token")
+        redirected = HTTPRedirectHandler().redirect_request(
+            requests[2], None, 302, "Found", {}, "https://release-assets.githubusercontent.com/package")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_only_treats_a_missing_release_as_absent(self):
+        github = distribution.GitHub("owner/repository", "test-token")
+        for status in (404, 401, 403):
+            error = HTTPError("url", status, "Error", {}, io.BytesIO())
+            with patch.object(distribution, "urlopen", side_effect=error):
+                if status == 404:
+                    self.assertIsNone(github.release("apt"))
+                else:
+                    with self.assertRaises(HTTPError):
+                        github.release("apt")
 
 
 class Packaging(unittest.TestCase):
@@ -227,6 +293,44 @@ class Packaging(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsigned"):
             validate(unsigned / "apt", self.signer.fingerprint)
 
+    def test_selected_subkey_signs_and_exports_its_primary_identity(self):
+        home = self.folder / "subkey-selection"
+        home.mkdir(mode=0o700)
+        environment = {**os.environ, "GNUPGHOME": str(home)}
+        try:
+            run("gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
+                "--quick-generate-key", "Subkey tests <subkey@example.invalid>", "ed25519", "cert", "1d",
+                env=environment, capture_output=True)
+            listing = run("gpg", "--batch", "--with-colons", "--list-keys",
+                          env=environment, capture_output=True, text=True).stdout
+            primary = next(line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:"))
+            for _ in range(2):
+                run("gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
+                    "--quick-add-key", primary, "ed25519", "sign", "1d", env=environment, capture_output=True)
+
+            with patch.dict(os.environ, environment):
+                keys = distribution.signing_keys()
+                self.assertEqual(len(keys), 2)
+                self.assertTrue(all(key["subkey"] for key in keys))
+                with patch.object(sys.stdin, "isatty", return_value=True), \
+                        patch("builtins.input", return_value="1"), \
+                        patch("sys.stdout", new_callable=io.StringIO) as output:
+                    signer = Signer(distribution.select_key(keys))
+                self.assertIn("Signing subkey", output.getvalue())
+                document = self.folder / "subkey-signing.txt"
+                document.write_text("Sign with the selected subkey.\n")
+                signature = signer.sign(document)
+                status = signer.gpg("--status-fd", "1", "--verify", signature, document).stdout.decode()
+                self.assertIn("VALIDSIG " + keys[0]["fingerprint"], status)
+                self.assertEqual(signer.fingerprint, primary)
+                signer.export(home)
+                self.assertEqual((home / "key.fingerprint").read_text().strip(), primary)
+                verifier = Signer(primary, home / "verify")
+                verifier.gpg("--import", home / "yuzu.asc")
+                verifier.verify(signature, document)
+        finally:
+            run("gpgconf", "--kill", "gpg-agent", env=environment)
+
     def test_protected_local_key_uses_pinentry(self):
         home = self.folder / "protected-key"
         home.mkdir(mode=0o700)
@@ -268,70 +372,55 @@ class Packaging(unittest.TestCase):
             run("gpgconf", "--kill", "gpg-agent", env=environment)
 
     def test_restore_reuses_only_matching_signed_packages(self):
-        original_subprocess = subprocess.run
-        original_run = run
+        github = Mock()
+        github.release.side_effect = lambda channel: {"draft": False, "tag_name": channel, "assets": []}
 
-        def api(args, **kwargs):
-            if args[:2] == ["gh", "api"]:
-                return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"draft": False}), stderr="")
-            return original_subprocess(args, **kwargs)
+        def download(release, name, destination):
+            shutil.copyfile(self.repositories / release["tag_name"] / name, destination / name)
 
-        def download(*args, **kwargs):
-            if args[:3] == ("gh", "release", "download"):
-                name = args[args.index("--pattern") + 1]
-                destination = Path(args[args.index("--dir") + 1])
-                shutil.copyfile(self.repositories / args[3] / name, destination / name)
-                return subprocess.CompletedProcess(args, 0)
-            return original_run(*args, **kwargs)
+        github.download.side_effect = download
 
         root = self.folder / "restore"
-        with patch.object(distribution, "ROOT", root), patch.object(distribution, "run", download), \
-                patch.object(distribution.subprocess, "run", api):
-            distribution.restore(self.config, [self.app], self.signer)
+        with patch.object(distribution, "ROOT", root):
+            distribution.restore(self.config, [self.app], self.signer, github)
             self.assertEqual(digest(root / "dist/packages/apt/sample-app_1.2.3-1_amd64.deb"),
                              digest(self.repositories / "apt/sample-app_1.2.3-1_amd64.deb"))
             changed = copy.deepcopy(self.app)
             changed["description"] += " changed"
             with self.assertRaisesRegex(ValueError, "Increase the package revision"):
-                distribution.restore(self.config, [changed], self.signer)
+                distribution.restore(self.config, [changed], self.signer, github)
 
     def test_publisher_uploads_packages_before_indexes_and_refuses_replacement(self):
-        original_subprocess = subprocess.run
-        uploads = []
-        assets = []
-        draft = False
-
-        def api(args, **kwargs):
-            if args[:2] == ["gh", "api"]:
-                return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"draft": draft, "assets": assets}), stderr="")
-            return original_subprocess(args, **kwargs)
-
-        def upload(*args, **kwargs):
-            if args[0] != "gh":
-                return run(*args, **kwargs)
-            if args[:3] == ("gh", "release", "edit"):
-                return subprocess.CompletedProcess(args, 0)
-            self.assertEqual(args[:3], ("gh", "release", "upload"))
-            uploads.append(args)
-            return subprocess.CompletedProcess(args, 0)
-
+        github = Mock()
+        release = {"id": 1, "draft": False, "assets": []}
+        github.release.return_value = release
         directory = self.repositories / "apt"
-        with patch.object(distribution.subprocess, "run", api), \
-                patch.object(distribution, "run", upload):
-            distribution.publish(directory, self.config["github"], self.signer.fingerprint)
-            self.assertTrue(str(uploads[0][4]).endswith(".deb"))
-            self.assertEqual(Path(uploads[-1][4]).name, "InRelease")
-            self.assertNotIn("--clobber", uploads[0])
-            uploads.clear()
-            assets.append({"name": "sample-app_1.2.3-1_amd64.deb", "digest": "sha256:" + "0" * 64})
-            with self.assertRaisesRegex(ValueError, "Increase the package revision"):
-                distribution.publish(directory, self.config["github"], self.signer.fingerprint)
-            self.assertEqual(uploads, [])
-            assets.clear()
-            draft = True
-            distribution.publish(directory, self.config["github"], self.signer.fingerprint)
-            self.assertEqual([Path(args[4]).name for args in uploads[:2]],
-                             ["manifest.json", "manifest.json.sig"])
+        distribution.publish(directory, github, self.signer.fingerprint)
+        uploads = github.upload.call_args_list
+        self.assertTrue(uploads[0].args[1].name.endswith(".deb"))
+        self.assertEqual(uploads[-1].args[1].name, "InRelease")
+        self.assertNotIn("replace", uploads[0].kwargs)
+        github.upload.reset_mock()
+        release["assets"].append({"name": "sample-app_1.2.3-1_amd64.deb", "digest": "sha256:" + "0" * 64})
+        with self.assertRaisesRegex(ValueError, "Increase the package revision"):
+            distribution.publish(directory, github, self.signer.fingerprint)
+        github.upload.assert_not_called()
+        release["assets"].clear()
+        release["draft"] = True
+        distribution.publish(directory, github, self.signer.fingerprint)
+        self.assertEqual([call.args[1].name for call in github.upload.call_args_list[:2]],
+                         ["manifest.json", "manifest.json.sig"])
+        github.request.assert_called_with("/1", method="PATCH", data={"draft": False, "make_latest": "false"})
+
+        github.reset_mock()
+        github.release.return_value = None
+        github.request.return_value = {"id": 2, "draft": True, "assets": []}
+        distribution.publish(directory, github, self.signer.fingerprint)
+        creation = github.request.call_args_list[0].kwargs
+        self.assertEqual(creation["method"], "POST")
+        self.assertEqual(creation["data"]["tag_name"], "apt")
+        self.assertTrue(creation["data"]["draft"])
+        github.request.assert_called_with("/2", method="PATCH", data={"draft": False, "make_latest": "false"})
 
     def test_apt_release_hashes_and_flat_package_paths(self):
         directory = self.repositories / "apt"

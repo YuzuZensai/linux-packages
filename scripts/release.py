@@ -2,9 +2,11 @@
 """Build, sign locally with GPG, and optionally publish Linux repositories."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import gzip
+import getpass
 import hashlib
 import json
 import os
@@ -14,15 +16,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.error import HTTPError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from build import ARCHITECTURES, ROOT, digest, load_app, package_identity, run, write_file
 
 
 def signing_keys():
     listing = run("gpg", "--batch", "--with-colons", "--fixed-list-mode", "--with-fingerprint",
+                  "--with-subkey-fingerprint",
                   "--list-secret-keys", capture_output=True, text=True).stdout
     keys = []
     primary = None
+    component = None
     now = datetime.now(timezone.utc).timestamp()
 
     for line in listing.splitlines():
@@ -34,21 +41,28 @@ def signing_keys():
             valid = valid and int(fields[6]) > now
 
         if kind == "sec":
-            primary = {"fingerprint": "", "name": "", "valid": valid, "signing": False}
-            keys.append(primary)
+            primary = {"name": "", "valid": valid}
         if primary is None:
             continue
 
-        if kind in ("sec", "ssb") and valid and "s" in fields[11] and fields[14] != "#":
-            primary["signing"] = True
-        elif kind == "fpr" and not primary["fingerprint"]:
-            primary["fingerprint"] = fields[9].upper()
+        if kind in ("sec", "ssb"):
+            component = {
+                "primary": primary,
+                "fingerprint": "",
+                "subkey": kind == "ssb",
+                "usable": valid and "s" in fields[11] and fields[14] != "#",
+            }
+            keys.append(component)
+        elif kind == "fpr" and component is not None and not component["fingerprint"]:
+            component["fingerprint"] = fields[9].upper()
         elif kind == "uid" and valid and not primary["name"]:
             name = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda match: bytes([int(match[1], 16)]),
                           fields[9].encode()).decode("utf-8", errors="replace")
             primary["name"] = "".join(char if char.isprintable() else " " for char in name)
 
-    return [key for key in keys if key["valid"] and key["signing"]
+    return [{"fingerprint": key["fingerprint"], "name": key["primary"]["name"],
+             "subkey": key["subkey"]}
+            for key in keys if key["primary"]["valid"] and key["usable"]
             and re.fullmatch(r"[A-F0-9]{40}", key["fingerprint"])]
 
 
@@ -60,26 +74,32 @@ def select_key(keys):
 
     print("Choose a GPG key to sign the repository:")
     for index, key in enumerate(keys, 1):
-        print(f"  {index}. {key['name'] or 'Unnamed key'}\n     {key['fingerprint']}")
+        kind = "Signing subkey" if key.get("subkey") else "Primary key"
+        print(f"  {index}. {key['name'] or 'Unnamed key'} ({kind})\n     {key['fingerprint']}")
 
     while True:
         answer = input(f"Signing key (1-{len(keys)}, q to cancel): ").strip()
         if answer.lower() == "q":
             raise KeyboardInterrupt
         if answer.isdecimal() and 1 <= int(answer) <= len(keys):
-            return keys[int(answer) - 1]["fingerprint"]
+            return keys[int(answer) - 1]["fingerprint"] + "!"
         print(f"Enter a number from 1 to {len(keys)}, or q to cancel.")
 
 
 class Signer:
     def __init__(self, fingerprint, home=None):
-        if not re.fullmatch(r"[A-Fa-f0-9]{40}", fingerprint):
+        if not re.fullmatch(r"[A-Fa-f0-9]{40}!?", fingerprint):
             raise ValueError("Use the full 40-character signing-key fingerprint")
-        self.fingerprint = fingerprint.upper()
+        self.signing_key = fingerprint.upper()
+        self.fingerprint = self.signing_key.rstrip("!")
         self.environment = dict(os.environ)
         if home is not None:
             home.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.environment["GNUPGHOME"] = str(home)
+        if self.signing_key.endswith("!"):
+            listing = self.gpg("--with-colons", "--with-fingerprint", "--list-keys", self.fingerprint)
+            self.fingerprint = next(line.split(":")[9] for line in listing.stdout.decode().splitlines()
+                                    if line.startswith("fpr:"))
 
     def gpg(self, *args, secret=False):
         command = ["gpg", "--yes"]
@@ -89,7 +109,7 @@ class Signer:
 
     def sign(self, path, clear=False, armor=False):
         target = path.parent / "InRelease" if clear else Path(str(path) + ".sig")
-        self.gpg(*(["--armor"] if armor else []), "--local-user", self.fingerprint, "--output", target,
+        self.gpg(*(["--armor"] if armor else []), "--local-user", self.signing_key, "--output", target,
                  "--clearsign" if clear else "--detach-sign", path, secret=True)
         self.verify(target, None if clear else path)
         return target
@@ -231,26 +251,75 @@ def validate(directory, fingerprint):
     return manifest
 
 
-def publish(directory, repository, fingerprint):
+class GitHub:
+    def __init__(self, repository, token):
+        self.repository = repository
+        self.token = token
+
+    def request(self, path, method="GET", data=None, target=None):
+        uploading = isinstance(data, Path)
+        host = "uploads.github.com" if uploading else "api.github.com"
+        headers = {
+            "Accept": "application/octet-stream" if target else "application/vnd.github+json",
+            "User-Agent": "yuzu-linux-packages",
+            "X-GitHub-Api-Version": "2026-03-10",
+        }
+        if uploading:
+            headers["Content-Type"] = "application/octet-stream"
+            headers["Content-Length"] = str(data.stat().st_size)
+        elif data is not None:
+            headers["Content-Type"] = "application/json"
+        body = (data.open("rb") if uploading
+                else nullcontext(json.dumps(data).encode() if data is not None else None))
+        with body as payload:
+            request = Request(f"https://{host}/repos/{self.repository}/releases{path}",
+                              data=payload, headers=headers, method=method)
+            request.add_unredirected_header("Authorization", f"Bearer {self.token}")
+            with urlopen(request, timeout=300) as response:
+                if target is not None:
+                    with target.open("wb") as stream:
+                        shutil.copyfileobj(response, stream)
+                    return
+                contents = response.read()
+                return json.loads(contents) if contents else None
+
+    def release(self, channel):
+        try:
+            return self.request("/tags/" + quote(channel, safe=""))
+        except HTTPError as error:
+            error.close()
+            if error.code != 404:
+                raise
+            return None
+
+    def download(self, release, name, directory):
+        asset = next((asset for asset in release["assets"] if asset["name"] == name), None)
+        if asset is None:
+            raise ValueError(f"The published release is missing {name}.")
+        self.request(f"/assets/{asset['id']}", target=directory / name)
+
+    def upload(self, release, path, replace=False):
+        existing = next((asset for asset in release["assets"] if asset["name"] == path.name), None)
+        if existing:
+            if not replace:
+                raise ValueError(f"{path.name} is already published.")
+            self.request(f"/assets/{existing['id']}", method="DELETE")
+            release["assets"].remove(existing)
+        asset = self.request(f"/{release['id']}/assets?name={quote(path.name, safe='')}",
+                             method="POST", data=path)
+        release["assets"].append(asset)
+
+
+def publish(directory, github, fingerprint):
     manifest = validate(directory, fingerprint)
     channel = directory.name
-    result = subprocess.run(["gh", "api", f"repos/{repository}/releases/tags/{channel}"],
-                            capture_output=True, text=True)
-    new = result.returncode != 0
-    if new:
-
-        if "404" not in result.stderr:
-            raise RuntimeError(result.stderr)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md") as notes:
-            notes.write("Signed Linux package repository. This release is updated in place.\n"
-                        "See the repository README for installation instructions.\n")
-            notes.flush()
-            run("gh", "release", "create", channel, "--repo", repository, "--draft",
-                "--title", f"Yuzu packages: {channel}", "--notes-file", notes.name, "--latest=false")
-        release = json.loads(run("gh", "api", f"repos/{repository}/releases/tags/{channel}",
-                                 capture_output=True, text=True).stdout)
-    else:
-        release = json.loads(result.stdout)
+    release = github.release(channel)
+    if release is None:
+        release = github.request(method="POST", path="", data={
+            "tag_name": channel, "name": f"Yuzu packages: {channel}",
+            "body": "Signed Linux package repository. See the README for setup instructions.",
+            "draft": True, "make_latest": "false",
+        })
     if release.get("immutable"):
         raise ValueError(
             "The repository release cannot be updated because release immutability is enabled. "
@@ -259,23 +328,20 @@ def publish(directory, repository, fingerprint):
     remote = {asset["name"]: asset for asset in release["assets"]}
     packages = [p for p in sorted(directory.iterdir()) if p.name.endswith((".deb", ".pkg.tar.zst"))]
     if release["draft"] and not {"manifest.json", "manifest.json.sig"} <= remote.keys():
-
-
         if any(p.name in remote for p in packages):
             raise ValueError(
                 "The draft release contains packages without a signed manifest. "
                 "Delete the draft release and try again."
             )
         for name in ("manifest.json", "manifest.json.sig"):
-            run("gh", "release", "upload", channel, directory / name, "--repo", repository, "--clobber")
+            github.upload(release, directory / name, replace=True)
 
     for package in packages:
         if package.name in remote:
             checksum = remote[package.name].get("digest")
             if not checksum:
                 with tempfile.TemporaryDirectory(prefix="yuzu-remote-") as temporary:
-                    run("gh", "release", "download", channel, "--repo", repository,
-                        "--pattern", package.name, "--dir", temporary)
+                    github.download(release, package.name, Path(temporary))
                     checksum = "sha256:" + digest(Path(temporary) / package.name)
             if checksum != "sha256:" + digest(package):
                 raise ValueError(
@@ -283,19 +349,19 @@ def publish(directory, repository, fingerprint):
                     "Increase the package revision before publishing again."
                 )
         else:
-            run("gh", "release", "upload", channel, package, "--repo", repository)
+            github.upload(release, package)
 
 
     metadata = sorted((p for p in directory.iterdir() if p not in packages),
                       key=lambda p: (p.name == "InRelease", p.name == "Release.gpg", p.name))
     for path in metadata:
-        run("gh", "release", "upload", channel, path, "--repo", repository, "--clobber")
-    if new or release["draft"]:
-        run("gh", "release", "edit", channel, "--repo", repository, "--draft=false", "--latest=false")
+        github.upload(release, path, replace=True)
+    if release["draft"]:
+        github.request(f"/{release['id']}", method="PATCH", data={"draft": False, "make_latest": "false"})
     print(f"Published the {channel} repository, signed with key {manifest['fingerprint']}.")
 
 
-def restore(config, apps, signer):
+def restore(config, apps, signer, github):
     wanted = {"apt": {}}
     for app in apps:
         for arch in app["assets"]:
@@ -303,22 +369,16 @@ def restore(config, apps, signer):
             wanted["apt"][f"{app['name']}_{version}_{ARCHITECTURES[arch][0]}.deb"] = package_identity(app, config)
             wanted.setdefault(f"arch-{arch}", {})[f"{app['name']}-{version}-{arch}.pkg.tar.zst"] = package_identity(app, config)
     for channel, names in wanted.items():
-        response = subprocess.run(["gh", "api", f"repos/{config['github']}/releases/tags/{channel}"],
-                                  capture_output=True, text=True)
-        if response.returncode:
-            if "404" in response.stderr:
-                continue
-            raise RuntimeError(response.stderr)
-        release = json.loads(response.stdout)
+        release = github.release(channel)
+        if release is None:
+            continue
         remote_names = {asset["name"] for asset in release.get("assets", [])}
         if release["draft"] and not {"manifest.json", "manifest.json.sig"} <= remote_names:
-
             continue
         with tempfile.TemporaryDirectory(prefix="yuzu-restore-") as temporary:
             folder = Path(temporary)
             for name in ("manifest.json", "manifest.json.sig"):
-                run("gh", "release", "download", channel, "--repo", config["github"],
-                    "--pattern", name, "--dir", folder)
+                github.download(release, name, folder)
             signer.verify(folder / "manifest.json.sig", folder / "manifest.json")
             manifest = json.loads((folder / "manifest.json").read_text())
             if manifest["channel"] != channel or manifest["fingerprint"] != signer.fingerprint:
@@ -335,8 +395,7 @@ def restore(config, apps, signer):
                     continue
                 target = ROOT / "dist/packages" / channel
                 target.mkdir(parents=True, exist_ok=True)
-                run("gh", "release", "download", channel, "--repo", config["github"],
-                    "--pattern", name, "--dir", target)
+                github.download(release, name, target)
                 if digest(target / name) != manifest["files"][name]:
                     raise ValueError(f"Published package checksum mismatch: {name}")
 
@@ -349,8 +408,15 @@ def main():
     config = json.loads((ROOT / "repository.json").read_text())
     apps = [load_app(path) for path in sorted((ROOT / "apps").glob("*.json"))]
     try:
-        signer = Signer(args.key or select_key(signing_keys()))
+        selection = args.key or select_key(signing_keys())
+        signer = Signer(selection.rstrip("!") + "!")
         signer.gpg("--list-secret-keys", signer.fingerprint)
+        github = None
+        if args.publish:
+            token = os.environ.get("GITHUB_TOKEN") or getpass.getpass("GitHub access token: ")
+            if not token.strip():
+                raise ValueError("Enter a GitHub access token to publish the repositories.")
+            github = GitHub(config["github"], token.strip())
     except ValueError as error:
         parser.error(str(error))
     except (EOFError, KeyboardInterrupt):
@@ -358,11 +424,13 @@ def main():
         return
 
     shutil.rmtree(ROOT / "dist", ignore_errors=True)
-    restore(config, apps, signer)
+    if github:
+        restore(config, apps, signer, github)
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("SIGNING_") and key not in ("GH_TOKEN", "GITHUB_TOKEN")}
     run(sys.executable, ROOT / "scripts/build.py", env=environment)
     assemble(ROOT / "dist/packages", ROOT / "dist/repositories", config, apps, signer)
+    print("The signed repositories are ready in dist/repositories/.")
 
     if args.publish:
         run("bash", ROOT / "tests/install-eda.sh")
@@ -370,8 +438,11 @@ def main():
         for directory in directories:
             validate(directory, signer.fingerprint)
         for directory in directories:
-            publish(directory, config["github"], signer.fingerprint)
+            publish(directory, github, signer.fingerprint)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(f"Release stopped. {error}")

@@ -1,7 +1,7 @@
 # Maintainer guide
 
-Requires Python 3, GPG, GitHub CLI, Docker, and packaging tools. Run as a regular
-user with Docker access.
+Requires Python 3, GPG, and packaging tools. Publishing also needs Docker access.
+Run as a regular user.
 
 Ubuntu 24.04:
 
@@ -18,12 +18,13 @@ sudo pacman -Syu --needed fakeroot zstd squashfs-tools dpkg libarchive desktop-f
 ## Publish
 
 ```sh
-gh auth login
 export GPG_TTY="$(tty)"
 python3 scripts/release.py --publish
 ```
 
 Omit `--publish` to build and sign without uploading.
+Publishing asks for a GitHub token with repository Contents write access, or uses
+`GITHUB_TOKEN` if set.
 
 ## Update packages
 
