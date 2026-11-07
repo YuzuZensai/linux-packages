@@ -15,13 +15,13 @@ for distribution in ubuntu:24.04 debian:13-slim; do
 set -euo pipefail
 apt-get update -qq
 if ! DEBIAN_FRONTEND=noninteractive apt-get install --yes --quiet \
-    /workspace/dist/packages/apt/eda_*_amd64.deb >/tmp/eda-install.log 2>&1; then
+    /workspace/dist/packages/apt/eda_*_amd64.deb nodejs >/tmp/eda-install.log 2>&1; then
   cat /tmp/eda-install.log
   exit 1
 fi
 /opt/eda/resources/git/bin/git --version
 test "$(stat -c '%u:%g:%a' /opt/eda/chrome-sandbox)" = '0:0:4755'
 useradd --create-home eda-smoke
-runuser --user eda-smoke -- env ELECTRON_RUN_AS_NODE=1 eda /workspace/tests/eda-startup.cjs
+runuser --user eda-smoke -- node /workspace/tests/eda-startup.cjs
 CONTAINER
 done

@@ -11,4 +11,4 @@ assert.throws(
   /not properly installed/,
   "Native packages must leave updates to the package manager",
 );
-console.log("Installed Eda native startup passed; AppImage self-updates are disabled.");
+console.log("Installed Eda native addon check passed; AppImage self-updates are disabled.");
